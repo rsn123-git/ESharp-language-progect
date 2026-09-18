@@ -1,0 +1,1013 @@
+"""E# - a tiny, beginner-friendly programming language.
+
+Example E# program:
+
+    let name = "E#";
+    let total = 2 + 3 * 4;
+    print name;
+    if total > 10 {
+        print "The answer is bigger than ten";
+    }
+
+Run a file with:
+    python script4.py program.e#
+
+Talk to the computer in English with:
+    python script4.py
+    E#> say hello
+    E#> add 2 and 3
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import difflib
+import json
+import random
+import re
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from dataclasses import dataclass
+from typing import Any
+
+
+class ESharpError(Exception):
+    """Base class for language errors."""
+
+
+class LexerError(ESharpError):
+    pass
+
+
+class ParseError(ESharpError):
+    pass
+
+
+class RuntimeErrorESharp(ESharpError):
+    pass
+
+
+@dataclass(frozen=True)
+class Token:
+    kind: str
+    value: Any
+    line: int
+    column: int
+
+
+class Lexer:
+    _two_character_tokens = {"==", "!=", "<=", ">=", "&&", "||"}
+    _single_character_tokens = set("+-*/%(){};=<>!")
+    _keywords = {"let", "if", "else", "while", "print", "true", "false", "null"}
+
+    def tokenize(self, source: str) -> list[Token]:
+        tokens: list[Token] = []
+        index = 0
+        line = 1
+        column = 1
+
+        def advance(text: str) -> None:
+            nonlocal line, column
+            newlines = text.count("\n")
+            if newlines:
+                line += newlines
+                column = len(text) - text.rfind("\n")
+            else:
+                column += len(text)
+
+        while index < len(source):
+            char = source[index]
+
+            if char.isspace():
+                advance(char)
+                index += 1
+                continue
+
+            if source.startswith("//", index):
+                end = source.find("\n", index)
+                comment = source[index:] if end == -1 else source[index:end]
+                advance(comment)
+                index += len(comment)
+                continue
+
+            start_line, start_column = line, column
+
+            if char == '"':
+                index += 1
+                advance(char)
+                value: list[str] = []
+                while index < len(source) and source[index] != '"':
+                    if source[index] == "\\":
+                        if index + 1 >= len(source):
+                            raise LexerError(f"Unclosed string at {start_line}:{start_column}")
+                        escape = source[index + 1]
+                        escapes = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
+                        value.append(escapes.get(escape, escape))
+                        advance(source[index:index + 2])
+                        index += 2
+                    else:
+                        value.append(source[index])
+                        advance(source[index])
+                        index += 1
+                if index >= len(source):
+                    raise LexerError(f"Unclosed string at {start_line}:{start_column}")
+                advance('"')
+                index += 1
+                tokens.append(Token("STRING", "".join(value), start_line, start_column))
+                continue
+
+            number = re.match(r"(?:\d+\.\d+|\d+)", source[index:])
+            if number:
+                text = number.group(0)
+                value: int | float = float(text) if "." in text else int(text)
+                tokens.append(Token("NUMBER", value, start_line, start_column))
+                advance(text)
+                index += len(text)
+                continue
+
+            identifier = re.match(r"[A-Za-z_][A-Za-z0-9_]*", source[index:])
+            if identifier:
+                text = identifier.group(0)
+                kind = text.upper() if text in self._keywords else "IDENTIFIER"
+                tokens.append(Token(kind, text, start_line, start_column))
+                advance(text)
+                index += len(text)
+                continue
+
+            two = source[index:index + 2]
+            if two in self._two_character_tokens:
+                tokens.append(Token(two, two, start_line, start_column))
+                advance(two)
+                index += 2
+                continue
+
+            if char in self._single_character_tokens:
+                tokens.append(Token(char, char, start_line, start_column))
+                advance(char)
+                index += 1
+                continue
+
+            raise LexerError(f"Unexpected character {char!r} at {line}:{column}")
+
+        tokens.append(Token("EOF", None, line, column))
+        return tokens
+
+
+class Parser:
+    def __init__(self, tokens: list[Token]):
+        self.tokens = tokens
+        self.current = 0
+
+    def parse(self) -> list[tuple]:
+        statements = []
+        while not self.check("EOF"):
+            statements.append(self.statement())
+        return statements
+
+    def statement(self) -> tuple:
+        if self.match("LET"):
+            name = self.consume("IDENTIFIER", "Expected a variable name after 'let'.")
+            self.consume("=", "Expected '=' after the variable name.")
+            value = self.expression()
+            self.consume(";", "Expected ';' after the variable declaration.")
+            return ("let", name.value, value)
+
+        if self.match("PRINT"):
+            value = self.expression()
+            self.consume(";", "Expected ';' after print.")
+            return ("print", value)
+
+        if self.match("IF"):
+            condition = self.expression()
+            then_branch = self.block()
+            else_branch = []
+            if self.match("ELSE"):
+                else_branch = self.block()
+            return ("if", condition, then_branch, else_branch)
+
+        if self.match("WHILE"):
+            condition = self.expression()
+            return ("while", condition, self.block())
+
+        if self.check("IDENTIFIER") and self.check_next("="):
+            name = self.advance().value
+            self.advance()
+            value = self.expression()
+            self.consume(";", "Expected ';' after assignment.")
+            return ("assign", name, value)
+
+        expression = self.expression()
+        self.consume(";", "Expected ';' after expression.")
+        return ("expression", expression)
+
+    def block(self) -> list[tuple]:
+        self.consume("{", "Expected '{' to start a block.")
+        statements = []
+        while not self.check("}") and not self.check("EOF"):
+            statements.append(self.statement())
+        self.consume("}", "Expected '}' after the block.")
+        return statements
+
+    def expression(self) -> tuple:
+        return self.or_expression()
+
+    def or_expression(self) -> tuple:
+        expression = self.and_expression()
+        while self.match("||"):
+            expression = ("binary", self.previous().kind, expression, self.and_expression())
+        return expression
+
+    def and_expression(self) -> tuple:
+        expression = self.equality()
+        while self.match("&&"):
+            expression = ("binary", self.previous().kind, expression, self.equality())
+        return expression
+
+    def equality(self) -> tuple:
+        expression = self.comparison()
+        while self.match("==", "!="):
+            expression = ("binary", self.previous().kind, expression, self.comparison())
+        return expression
+
+    def comparison(self) -> tuple:
+        expression = self.term()
+        while self.match("<", "<=", ">", ">="):
+            expression = ("binary", self.previous().kind, expression, self.term())
+        return expression
+
+    def term(self) -> tuple:
+        expression = self.factor()
+        while self.match("+", "-"):
+            expression = ("binary", self.previous().kind, expression, self.factor())
+        return expression
+
+    def factor(self) -> tuple:
+        expression = self.unary()
+        while self.match("*", "/", "%"):
+            expression = ("binary", self.previous().kind, expression, self.unary())
+        return expression
+
+    def unary(self) -> tuple:
+        if self.match("!", "-"):
+            return ("unary", self.previous().kind, self.unary())
+        return self.primary()
+
+    def primary(self) -> tuple:
+        if self.match("NUMBER", "STRING"):
+            return ("literal", self.previous().value)
+        if self.match("TRUE"):
+            return ("literal", True)
+        if self.match("FALSE"):
+            return ("literal", False)
+        if self.match("NULL"):
+            return ("literal", None)
+        if self.match("IDENTIFIER"):
+            return ("variable", self.previous().value)
+        if self.match("("):
+            expression = self.expression()
+            self.consume(")", "Expected ')' after expression.")
+            return expression
+        token = self.peek()
+        raise ParseError(f"Expected an expression at {token.line}:{token.column}.")
+
+    def match(self, *kinds: str) -> bool:
+        for kind in kinds:
+            if self.check(kind):
+                self.advance()
+                return True
+        return False
+
+    def consume(self, kind: str, message: str) -> Token:
+        if self.check(kind):
+            return self.advance()
+        token = self.peek()
+        raise ParseError(f"{message} Found {token.value!r} at {token.line}:{token.column}.")
+
+    def check(self, kind: str) -> bool:
+        return self.peek().kind == kind
+
+    def check_next(self, kind: str) -> bool:
+        if self.current + 1 >= len(self.tokens):
+            return False
+        return self.tokens[self.current + 1].kind == kind
+
+    def advance(self) -> Token:
+        if not self.check("EOF"):
+            self.current += 1
+        return self.previous()
+
+    def peek(self) -> Token:
+        return self.tokens[self.current]
+
+    def previous(self) -> Token:
+        return self.tokens[self.current - 1]
+
+
+class Environment:
+    def __init__(self):
+        self.values: dict[str, Any] = {}
+
+    def define(self, name: str, value: Any) -> None:
+        self.values[name] = value
+
+    def assign(self, name: str, value: Any) -> None:
+        if name not in self.values:
+            raise RuntimeErrorESharp(f"Cannot assign to undefined variable '{name}'.")
+        self.values[name] = value
+
+    def get(self, name: str) -> Any:
+        if name not in self.values:
+            raise RuntimeErrorESharp(f"Undefined variable '{name}'.")
+        return self.values[name]
+
+
+class Interpreter:
+    def __init__(self, output=print):
+        self.environment = Environment()
+        self.output = output
+
+    def run(self, source: str) -> None:
+        tokens = Lexer().tokenize(source)
+        program = Parser(tokens).parse()
+        for statement in program:
+            self.execute(statement)
+
+    def execute(self, statement: tuple) -> None:
+        kind = statement[0]
+        if kind == "let":
+            self.environment.define(statement[1], self.evaluate(statement[2]))
+        elif kind == "assign":
+            self.environment.assign(statement[1], self.evaluate(statement[2]))
+        elif kind == "print":
+            self.output(self.display(self.evaluate(statement[1])))
+        elif kind == "expression":
+            self.evaluate(statement[1])
+        elif kind == "if":
+            branch = statement[2] if self.is_truthy(self.evaluate(statement[1])) else statement[3]
+            for nested in branch:
+                self.execute(nested)
+        elif kind == "while":
+            while self.is_truthy(self.evaluate(statement[1])):
+                for nested in statement[2]:
+                    self.execute(nested)
+
+    def evaluate(self, expression: tuple) -> Any:
+        kind = expression[0]
+        if kind == "literal":
+            return expression[1]
+        if kind == "variable":
+            return self.environment.get(expression[1])
+        if kind == "unary":
+            value = self.evaluate(expression[2])
+            if expression[1] == "!":
+                return not self.is_truthy(value)
+            if expression[1] == "-":
+                self.require_number(value, "Unary '-'")
+                return -value
+        if kind == "binary":
+            operator = expression[1]
+            left = self.evaluate(expression[2])
+            if operator == "&&" and not self.is_truthy(left):
+                return False
+            if operator == "||" and self.is_truthy(left):
+                return True
+            right = self.evaluate(expression[3])
+            return self.binary(operator, left, right)
+        raise RuntimeErrorESharp(f"Unknown expression node: {kind}")
+
+    def binary(self, operator: str, left: Any, right: Any) -> Any:
+        if operator == "+":
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                return left + right
+            if isinstance(left, str) and isinstance(right, str):
+                return left + right
+            raise RuntimeErrorESharp("The '+' operator needs two numbers or two strings.")
+        if operator in {"-", "*", "/", "%", "<", "<=", ">", ">="}:
+            self.require_number_pair(left, right, operator)
+            if operator == "-":
+                return left - right
+            if operator == "*":
+                return left * right
+            if operator == "/":
+                if right == 0:
+                    raise RuntimeErrorESharp("Cannot divide by zero.")
+                return left / right
+            if operator == "%":
+                if right == 0:
+                    raise RuntimeErrorESharp("Cannot use zero as a remainder divisor.")
+                return left % right
+            return {"<": left < right, "<=": left <= right, ">": left > right, ">=": left >= right}[operator]
+        if operator == "==":
+            return left == right
+        if operator == "!=":
+            return left != right
+        if operator in {"&&", "||"}:
+            return self.is_truthy(left) and self.is_truthy(right) if operator == "&&" else self.is_truthy(left) or self.is_truthy(right)
+        raise RuntimeErrorESharp(f"Unknown operator '{operator}'.")
+
+    @staticmethod
+    def is_truthy(value: Any) -> bool:
+        return bool(value)
+
+    @staticmethod
+    def display(value: Any) -> str:
+        if value is None:
+            return "null"
+        if value is True:
+            return "true"
+        if value is False:
+            return "false"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    @staticmethod
+    def require_number(value: Any, operation: str) -> None:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise RuntimeErrorESharp(f"{operation} needs a number.")
+
+    def require_number_pair(self, left: Any, right: Any, operation: str) -> None:
+        self.require_number(left, operation)
+        self.require_number(right, operation)
+
+
+class EnglishInterpreter:
+    """A simple natural-language front end for the E# interpreter."""
+
+    _command_words = {
+        "help", "what", "can", "you", "do", "show", "variables", "list",
+        "remember", "set", "let", "as", "to", "say", "print", "tell", "me",
+        "calculate", "is", "add", "subtract", "multiply", "divide", "and",
+        "by", "repeat", "times", "exit", "quit", "true", "false", "yes", "no",
+        "null", "hello", "hi", "hey", "thanks", "thank", "goodbye", "bye",
+        "who", "are", "your", "name", "how", "old", "time", "date", "today",
+        "increase", "decrease", "change", "from", "into", "my", "i", "am",
+        "devs", "developer", "developers", "developed", "develop", "built", "made",
+        "haha", "hahaha", "lol", "lmao", "rofl", "funny",
+        "clear", "memory", "forget", "uppercase", "lowercase", "length", "of",
+        "count", "from", "to", "coin", "flip", "roll", "dice", "square", "power",
+        "random", "number", "choose", "between", "reverse", "palindrome", "words",
+        "convert", "celsius", "fahrenheit", "temperature", "days", "until", "date",
+        "define", "definition", "meaning", "mean", "means", "word", "spell", "spelling",
+    }
+    _corrections = {
+        "pritn": "print",
+        "prnt": "print",
+        "sya": "say",
+        "saay": "say",
+        "rember": "remember",
+        "remmber": "remember",
+        "remeber": "remember",
+        "calclate": "calculate",
+        "calculte": "calculate",
+        "ad": "add",
+        "substract": "subtract",
+        "multipl": "multiply",
+        "multy": "multiply",
+        "divde": "divide",
+        "repeet": "repeat",
+        "repete": "repeat",
+        "timse": "times",
+        "tims": "times",
+        "an": "and",
+        "adn": "and",
+        "ann": "and",
+        "wht": "what",
+        "hw": "how",
+        "hlep": "help",
+    }
+
+    def __init__(self, output=print):
+        self.e_sharp = Interpreter(output=output)
+        self.output = output
+
+    def run_line(self, line: str) -> None:
+        original = line.strip()
+        command = self.autocorrect(original)
+        if not command:
+            return
+        if command != original:
+            self.output(f"(I corrected that to: {command})")
+        lower = command.lower()
+        normalized = lower.rstrip(" ?!.")
+
+        if normalized in {"hi", "hello", "hey", "hello there", "good morning", "good evening"}:
+            self.output("Hello! I am E#. Tell me what you want to do.")
+            return
+        if normalized in {"how are you", "how are you doing", "how do you feel"}:
+            self.output("I am doing well and ready to help.")
+            return
+        if normalized in {"what are you doing", "what are you up to"}:
+            self.output("I am listening for your next message.")
+            return
+        if normalized in {"are you real", "are you a robot", "are you human"}:
+            self.output("I am a computer program, not a human, but I can talk and run E# commands.")
+            return
+        if normalized in {"do you like me", "do you like humans"}:
+            self.output("Yes. I enjoy helping people learn and create things.")
+            return
+        if normalized in {"what do you like", "what is your favorite thing"}:
+            self.output("I like solving problems, explaining ideas, and running E# programs.")
+            return
+        if normalized in {"how old are you", "when were you made"}:
+            self.output("I do not have a human age. I am the E# program you are building.")
+            return
+        if normalized in {"tell me a joke", "say a joke", "make me laugh"}:
+            self.output("Why did the programmer go broke? Because they used up all their cache.")
+            return
+        if normalized in {"good job", "well done", "you are smart"}:
+            self.output("Thank you! We are building E# together.")
+            return
+        if normalized in {"thanks", "thank you", "thx"}:
+            self.output("You're welcome.")
+            return
+        if normalized in {"haha", "hahaha", "lol", "lmao", "rofl"}:
+            self.output("Haha! That is funny.")
+            return
+        if re.fullmatch(r"(?:haha|hahaha|lol|lmao|rofl)[!?.]*\s+.+", lower):
+            self.output("I can tell you are laughing!")
+            return
+        if normalized in {"that is funny", "thats funny", "that's funny", "so funny"}:
+            self.output("I am glad you liked it!")
+            return
+        if normalized in {"goodbye", "bye"}:
+            self.output("Goodbye!")
+            return
+        dictionary_command = re.fullmatch(
+            r"(?:define|definition of|meaning of)\s+([A-Za-z][A-Za-z'-]*)|what does\s+([A-Za-z][A-Za-z'-]*)\s+mean",
+            command,
+            re.IGNORECASE,
+        )
+        if dictionary_command:
+            word = dictionary_command.group(1) or dictionary_command.group(2)
+            self.output(self.define_word(word))
+            return
+        spelling_command = re.fullmatch(
+            r"(?:spell|spelling of)\s+([A-Za-z][A-Za-z'-]*)",
+            command,
+            re.IGNORECASE,
+        )
+        if spelling_command:
+            word = spelling_command.group(1)
+            self.output(" ".join(word.upper()))
+            return
+        if normalized in {"who are you", "what are you", "what is your name"}:
+            self.output("I am E#, your small English-speaking programming assistant.")
+            return
+        if lower in {
+            "devs",
+            "dev",
+            "developer",
+            "developers",
+            "who developed this",
+            "who developed e#",
+            "who made this",
+            "who built this",
+        }:
+            self.output("E# was developed by Rishi, with help from GitHub Copilot.")
+            return
+        question = self.answer_question(command)
+        if question is not None:
+            self.output(question)
+            return
+        if lower in {"clear memory", "forget everything", "forget all", "reset memory"}:
+            self.e_sharp.environment.values.clear()
+            self.output("I forgot everything I remembered.")
+            return
+        forget = re.fullmatch(r"(?:forget|delete|remove)\s+([A-Za-z_][A-Za-z0-9_]*)", command, re.IGNORECASE)
+        if forget:
+            name = forget.group(1)
+            if name not in self.e_sharp.environment.values:
+                raise RuntimeErrorESharp(f"I do not remember '{name}'.")
+            del self.e_sharp.environment.values[name]
+            self.output(f"I forgot {name}.")
+            return
+        if lower in {"flip a coin", "flip coin"}:
+            self.output(random.choice(["heads", "tails"]))
+            return
+        if lower in {"roll a die", "roll die", "roll a dice", "roll dice"}:
+            self.output(str(random.randint(1, 6)))
+            return
+        random_number = re.fullmatch(
+            r"(?:random\s+number|random)\s+between\s+(-?\d+)\s+and\s+(-?\d+)",
+            command,
+            re.IGNORECASE,
+        )
+        if random_number:
+            first, second = int(random_number.group(1)), int(random_number.group(2))
+            self.output(str(random.randint(min(first, second), max(first, second))))
+            return
+        choose = re.fullmatch(r"choose\s+(.+)", command, re.IGNORECASE)
+        if choose:
+            options = [item.strip() for item in choose.group(1).split(",") if item.strip()]
+            if len(options) < 2:
+                raise RuntimeErrorESharp("Give me at least two choices separated by commas.")
+            self.output(random.choice(options))
+            return
+        reverse = re.fullmatch(r"reverse\s+(.+)", command, re.IGNORECASE)
+        if reverse:
+            text = self.value_from_english(reverse.group(1), allow_text=True)
+            self.output(str(text)[::-1])
+            return
+        palindrome = re.fullmatch(r"is\s+(.+)\s+a\s+palindrome\??", command, re.IGNORECASE)
+        if palindrome:
+            text = str(self.value_from_english(palindrome.group(1), allow_text=True))
+            normalized = re.sub(r"[^a-z0-9]", "", text.lower())
+            self.output("yes" if normalized == normalized[::-1] else "no")
+            return
+        word_count = re.fullmatch(r"(?:count\s+)?words\s+in\s+(.+)", command, re.IGNORECASE)
+        if word_count:
+            text = str(self.value_from_english(word_count.group(1), allow_text=True)).strip()
+            self.output(str(len(text.split())) if text else "0")
+            return
+        conversion = re.fullmatch(
+            r"convert\s+(-?(?:\d+(?:\.\d*)?|\.\d+))\s+degrees?\s+(celsius|fahrenheit)\s+to\s+(celsius|fahrenheit)",
+            command,
+            re.IGNORECASE,
+        )
+        if conversion:
+            value = float(conversion.group(1))
+            source = conversion.group(2).lower()
+            target = conversion.group(3).lower()
+            if source == target:
+                result = value
+            elif source == "celsius":
+                result = value * 9 / 5 + 32
+            else:
+                result = (value - 32) * 5 / 9
+            self.output(self.e_sharp.display(result) + f" degrees {target}")
+            return
+        count = re.fullmatch(r"count(?: from)?\s+(-?\d+)\s+to\s+(-?\d+)", command, re.IGNORECASE)
+        if count:
+            start, end = (int(count.group(1)), int(count.group(2)))
+            step = 1 if end >= start else -1
+            self.output(" ".join(str(number) for number in range(start, end + step, step)))
+            return
+        text_tool = re.fullmatch(r"(uppercase|lowercase|length of)\s+(.+)", command, re.IGNORECASE)
+        if text_tool:
+            action, raw_text = text_tool.groups()
+            text = self.value_from_english(raw_text, allow_text=True)
+            if action.lower() == "uppercase":
+                self.output(str(text).upper())
+            elif action.lower() == "lowercase":
+                self.output(str(text).lower())
+            else:
+                self.output(str(len(text)))
+            return
+        square = re.fullmatch(r"(?:square|power)\s+(.+)", command, re.IGNORECASE)
+        if square:
+            value = self.value_from_english(square.group(1))
+            self.e_sharp.require_number(value, "Square")
+            self.output(self.e_sharp.display(value * value))
+            return
+        if lower in {"what time is it", "what is the time", "tell me the time"}:
+            self.output(datetime.now().strftime("It is %H:%M."))
+            return
+        if lower in {"what is today's date", "what is the date", "what date is it", "what day is it"}:
+            self.output(datetime.now().strftime("Today is %A, %B %d, %Y."))
+            return
+
+        if lower in {"help", "what can you do"}:
+            self.output("Try: say hello | remember age as 12 | add 2 and 3 | calculate 5 * 4")
+            self.output("Also: what is age | increase age by 1 | what time is it | say hello")
+            return
+        if lower in {"show variables", "list variables", "what do you remember"}:
+            if not self.e_sharp.environment.values:
+                self.output("I do not remember anything yet.")
+            else:
+                for name, value in self.e_sharp.environment.values.items():
+                    self.output(f"{name} = {self.e_sharp.display(value)}")
+            return
+
+        personal_value = re.fullmatch(
+            r"(?!(?:what|tell)\s+)(?:my\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+is\s+(.+)",
+            command,
+            re.IGNORECASE,
+        )
+        if personal_value:
+            name, raw_value = personal_value.groups()
+            self.e_sharp.environment.define(name, self.value_from_english(raw_value, allow_text=True))
+            self.output(f"Okay, I will remember that your {name} is {self.e_sharp.display(self.e_sharp.environment.get(name))}.")
+            return
+
+        ask_value = re.fullmatch(
+            r"(?:what\s+is|what's|tell\s+me)\s+(?:my\s+)?([A-Za-z_][A-Za-z0-9_]*)\??",
+            command,
+            re.IGNORECASE,
+        )
+        if ask_value:
+            name = ask_value.group(1)
+            self.output(self.e_sharp.display(self.e_sharp.environment.get(name)))
+            return
+
+        repeat = re.fullmatch(r"repeat\s+(\d+)\s+times(?:\s+(.+))?", command, re.IGNORECASE)
+        if repeat:
+            count = int(repeat.group(1))
+            action = repeat.group(2)
+            if not action:
+                raise RuntimeErrorESharp("Tell me what to repeat, for example: repeat 3 times say hello.")
+            for _ in range(count):
+                self.run_line(action)
+            return
+
+        change = re.fullmatch(
+            r"(increase|decrease)\s+([A-Za-z_][A-Za-z0-9_]*)\s+by\s+(.+)",
+            command,
+            re.IGNORECASE,
+        )
+        if change:
+            direction, name, amount_text = change.groups()
+            current = self.e_sharp.environment.get(name)
+            amount = self.value_from_english(amount_text)
+            self.e_sharp.require_number_pair(current, amount, direction)
+            result = current + amount if direction.lower() == "increase" else current - amount
+            self.e_sharp.environment.assign(name, result)
+            self.output(f"{name} is now {self.e_sharp.display(result)}.")
+            return
+
+        remember = re.fullmatch(
+            r"(?:remember|set|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:as|to|=)\s+(.+)",
+            command,
+            re.IGNORECASE,
+        )
+        if remember:
+            name, raw_value = remember.groups()
+            self.e_sharp.environment.define(name, self.value_from_english(raw_value, allow_text=True))
+            self.output(f"Okay, I remembered {name}.")
+            return
+
+        say = re.match(r"(?:say|print|tell me)\s+(.+)", command, re.IGNORECASE)
+        if say:
+            self.output(self.e_sharp.display(self.value_from_english(say.group(1), allow_text=True)))
+            return
+
+        calculation = re.match(
+            r"(?:calculate|what is)\s+(.+)",
+            command,
+            re.IGNORECASE,
+        )
+        if calculation:
+            self.output(self.e_sharp.display(self.evaluate_expression(calculation.group(1))))
+            return
+
+        operation = re.fullmatch(
+            r"(add|subtract|multiply|divide)\s+(.+?)\s+(?:and|by)\s+(.+)",
+            command,
+            re.IGNORECASE,
+        )
+        if operation:
+            name, left_text, right_text = operation.groups()
+            left = self.value_from_english(left_text)
+            right = self.value_from_english(right_text)
+            operators = {"add": "+", "subtract": "-", "multiply": "*", "divide": "/"}
+            result = self.e_sharp.binary(operators[name.lower()], left, right)
+            self.output(self.e_sharp.display(result))
+            return
+
+        if self.looks_like_e_sharp(command):
+            self.e_sharp.run(command if command.endswith(";") else command + ";")
+            return
+
+        raise RuntimeErrorESharp(
+            "I do not understand that yet. Type 'help' for examples, or say "
+            "'say ...' if you want me to repeat a sentence."
+        )
+
+    def answer_question(self, command: str) -> str | None:
+        """Answer small, deterministic questions without pretending to be a search engine."""
+        question = command.strip().rstrip(" ?!.")
+        lower = question.lower()
+        common_answers = {
+            "what is  e#": "E# is the programming language you are building.",
+            "what is e#": "E# is the programming language you are building.",
+            "what is python": "Python is a popular general-purpose programming language.",
+            "what is a computer": "A computer is a machine that processes instructions and data.",
+            "what is programming": "Programming is writing instructions for a computer.",
+            "why is the sky blue": "The sky looks blue because air scatters blue light more than most other visible colors.",
+            "how many days are in a week": "There are 7 days in a week.",
+            "how many months are in a year": "There are 12 months in a year.",
+            "what is the capital of france": "The capital of France is Paris.",
+        }
+        if lower in common_answers:
+            return common_answers[lower]
+
+        yes_no = re.fullmatch(r"(?:is|are|can|do|does|will)\s+(.+)", question, re.IGNORECASE)
+        if yes_no:
+            subject = yes_no.group(1).lower()
+            if subject in {"e# real", "e# a programming language", "programming useful"}:
+                return "Yes."
+            if subject in {"fire cold", "2 bigger than 10"}:
+                return "No."
+
+        what_is = re.fullmatch(r"(?:what is|what's)\s+(.+)", question, re.IGNORECASE)
+        if what_is:
+            topic = what_is.group(1).strip().rstrip(" ?!.")
+            if topic in self.e_sharp.environment.values:
+                return self.e_sharp.display(self.e_sharp.environment.get(topic))
+            try:
+                return self.e_sharp.display(self.evaluate_expression(topic))
+            except ESharpError:
+                return f"I do not know the answer to '{topic}' yet."
+
+        how_many = re.fullmatch(r"how many\s+(.+)", question, re.IGNORECASE)
+        if how_many and how_many.group(1).lower() in {"days in a week", "months in a year"}:
+            return "There are 7 days in a week." if "days" in how_many.group(1).lower() else "There are 12 months in a year."
+
+        if re.match(r"^(who|what|when|where|why|how|is|are|can|do|does|will)\b", lower):
+            return "I do not know the answer to that yet, but I can still help with E# commands."
+
+        return None
+
+    def define_word(self, word: str) -> str:
+        """Look up an English word online, with a useful offline fallback."""
+        word = word.lower()
+        fallback = {
+            "computer": "A machine that processes data and follows instructions.",
+            "programming": "The act of writing instructions for a computer.",
+            "language": "A system used for communication.",
+            "dictionary": "A reference that lists words and their meanings.",
+            "algorithm": "A step-by-step method for solving a problem.",
+            "variable": "A named value that can be stored and changed in a program.",
+            "function": "A reusable block of code that performs a task.",
+            "hello": "A greeting used when meeting someone.",
+            "happy": "Feeling pleasure, joy, or satisfaction.",
+            "learn": "To gain knowledge or skill through study or experience.",
+        }
+        if word in fallback:
+            return f"{word}: {fallback[word]}"
+
+        request = Request(
+            f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}",
+            headers={"User-Agent": "ESharp/1.0"},
+        )
+        try:
+            with urlopen(request, timeout=4) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            if error.code == 404:
+                return f"I could not find '{word}' in the dictionary."
+            return f"The dictionary service returned HTTP {error.code}."
+        except (URLError, TimeoutError):
+            return f"I cannot reach the online dictionary right now. Try again later."
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return "The dictionary returned an invalid response."
+
+        meanings = []
+        for entry in data:
+            for meaning in entry.get("meanings", []):
+                part_of_speech = meaning.get("partOfSpeech", "word")
+                definitions = meaning.get("definitions", [])
+                if definitions:
+                    meanings.append(f"{part_of_speech}: {definitions[0].get('definition', '')}")
+        if not meanings:
+            return f"I found '{word}', but no definition was available."
+        return f"{word}: " + " | ".join(meanings[:3])
+
+    def autocorrect(self, command: str) -> str:
+        """Correct command vocabulary without changing text after 'say'."""
+        if not command:
+            return command
+        command = re.sub(r"^(?:please\s+|computer[,:]?\s+)", "", command, flags=re.IGNORECASE)
+        preserved_target = re.match(
+            r"^(define|spell|definition of|meaning of|spelling of|what does)\s+(.+)$",
+            command,
+            re.IGNORECASE,
+        )
+        if preserved_target:
+            prefix, target = preserved_target.groups()
+            corrected_prefix = " ".join(self.correct_word(part) for part in prefix.split())
+            return f"{corrected_prefix} {target}"
+        words = command.split()
+        first = words[0].lower()
+        first = self.correct_word(first)
+
+        if first in {"say", "print"}:
+            return first + command[len(words[0]):]
+
+        corrected = [first]
+        for word in words[1:]:
+            punctuation = ""
+            bare = word
+            while bare and bare[-1] in ".,!?":
+                punctuation = bare[-1] + punctuation
+                bare = bare[:-1]
+            corrected.append(self.correct_word(bare) + punctuation)
+        return " ".join(corrected)
+
+    def correct_word(self, word: str) -> str:
+        lower = word.lower()
+        if lower in self._corrections:
+            return self._corrections[lower]
+        if lower in self._command_words or len(lower) < 4:
+            return word
+        match = difflib.get_close_matches(lower, self._command_words, n=1, cutoff=0.78)
+        return match[0] if match else word
+
+    def evaluate_expression(self, source: str) -> Any:
+        tokens = Lexer().tokenize(source)
+        parser = Parser(tokens)
+        expression = parser.expression()
+        if not parser.check("EOF"):
+            token = parser.peek()
+            raise ParseError(f"Unexpected {token.value!r} at {token.line}:{token.column}.")
+        return self.e_sharp.evaluate(expression)
+
+    def value_from_english(self, source: str, allow_text: bool = False) -> Any:
+        value = source.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            return value[1:-1]
+        if re.fullmatch(r"-?\d+", value):
+            return int(value)
+        if re.fullmatch(r"-?(?:\d+\.\d*|\.\d+)", value):
+            return float(value)
+        if value.lower() in {"true", "yes"}:
+            return True
+        if value.lower() in {"false", "no"}:
+            return False
+        if value.lower() == "null":
+            return None
+        if value in self.e_sharp.environment.values:
+            return self.e_sharp.environment.get(value)
+        if re.search(r"[+\-*/%<>=()]", value):
+            return self.evaluate_expression(value)
+        if allow_text:
+            return value
+        raise RuntimeErrorESharp(
+            f"I need a number, a quoted message, or a remembered name; I got {value!r}."
+        )
+
+    @staticmethod
+    def looks_like_e_sharp(command: str) -> bool:
+        return command.lower().startswith(("let ", "if ", "while ", "print "))
+
+
+DEMO_PROGRAM = """\
+// E# hello world
+let name = "E#";
+let number = 2 + 3 * 4;
+print "Welcome to " + name;
+print number;
+
+if number > 10 {
+    print "The condition works!";
+}
+
+let count = 0;
+while count < 3 {
+    print count;
+    count = count + 1;
+}
+"""
+
+
+def repl() -> None:
+    interpreter = EnglishInterpreter()
+    print("E# English mode. Type 'help' for examples, or 'exit' to quit.")
+    while True:
+        try:
+            source = input("E#> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if source.strip().lower() in {"exit", "quit"}:
+            return
+        if not source.strip():
+            continue
+        try:
+            interpreter.run_line(source)
+        except ESharpError as error:
+            print(f"Error: {error}", file=sys.stderr)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run programs written in E#.")
+    parser.add_argument("file", nargs="?", help="Path to an E# source file (.e#).")
+    parser.add_argument(
+        "--repl",
+        "--english",
+        action="store_true",
+        help="Start the English-language E# prompt.",
+    )
+    parser.add_argument("--demo", action="store_true", help="Run the built-in E# demo.")
+    args = parser.parse_args()
+
+    try:
+        if args.repl:
+            repl()
+        elif args.file:
+            with open(args.file, encoding="utf-8") as source_file:
+                Interpreter().run(source_file.read())
+        elif args.demo:
+            Interpreter().run(DEMO_PROGRAM)
+        else:
+            repl()
+    except (OSError, ESharpError) as error:
+        print(f"E# error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
