@@ -1,2 +1,9 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+<?xml version="1.0" encoding="UTF-8" ?>
+<NotepadPlus>
+    <Session activeView="0">
+        <mainView activeIndex="0">
+            <File firstVisibleLine="429" xOffset="0" scrollWidth="1031" startPos="17186" endPos="17186" selMode="0" offset="0" wrapCount="1" lang="Properties" encoding="-1" userReadOnly="no" filename="C:\Users\rishi\OneDrive\Documents\GitHub\Git\.gitattributes" backupFilePath="C:\Users\rishi\AppData\Roaming\Notepad++\backup\.gitattributes@2026-09-18_121009" originalFileLastModifTimestamp="460988149" originalFileLastModifTimestampHigh="31278810" tabColourId="-1" RTL="no" tabPinned="no" mapFirstVisibleDisplayLine="-1" mapFirstVisibleDocLine="-1" mapLastVisibleDocLine="-1" mapNbLine="-1" mapHigherPos="-1" mapWidth="-1" mapHeight="-1" mapKByteInDoc="512" mapWrapIndentMode="-1" mapIsWrap="no" />
+        </mainView>
+        <subView activeIndex="0" />
+    </Session>
+</NotepadPlus>
