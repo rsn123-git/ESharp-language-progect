@@ -1,0 +1,3 @@
+This is the E# (ESharp) Language Project
+It was made for the reason most people quit programming. Complicated syntax...
+Just write English in the terminal And done!
